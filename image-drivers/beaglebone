@@ -1,0 +1,88 @@
+#!/bin/bash
+
+# Create a disk image with MBR partition table and 2 partitions. Also installs
+# the MLO and u-boot.img bootloader files at fixed addresses (not in a partition).
+# See http://elinux.org/Beagleboard:U-boot_partitioning_layout_2.0
+# ------------------------------------------------------------------------------
+# part | label             | mount point | fs   | size
+# ------------------------------------------------------------------------------
+#    1 | ${BOOT_PART_NAME} | /boot/flash | VFAT | 48MB
+#    2 | ${ROOT_PART_NAME} | /           | ext4 | ${IMAGE_FILE_SIZE} - 48MB
+# ------------------------------------------------------------------------------
+#
+# Variables:
+# BOOT_PART_NAME: Label of boot partition. Default: BOOT
+# ROOT_PART_NAME: Label of root partition. Default: ROOTFS
+# IMAGE_FILE_SIZE: The size of the entire image file. Default: 3800M
+# MLO_FILE: The first-stage bootloader file
+# UBOOT_IMG_FILE: The second-stage bootloader file
+# 
+
+BOOT_PART_NAME=${BOOT_PART_NAME:-BOOT}
+ROOT_PART_NAME=${ROOT_PART_NAME:-ROOTFS}
+IMAGE_FILE_SIZE=${IMAGE_FILE_SIZE:-3800M}
+
+# convert megabytes to sectors. $1 is size in megabytes.
+brp_to_sector() {
+    echo $(( $1 * 1024 * 1024 / 512 ))
+}
+
+case $1 in
+
+validate)
+        [ ${#BOOT_PART_NAME} -gt 11 ] && \
+            { echo "BOOT_PART_NAME cannot be more than 11 characters."; exit 1; }
+        # see https://en.wikipedia.org/wiki/Label_%28command%29
+        echo $BOOT_PART_NAME | egrep -q '^[A-Z0-9_-]*$' || \
+            { echo "BOOT_PART_NAME contains invalid characters"; exit 1; }
+
+        [ ${#ROOT_PART_NAME} -gt 16 ] && \
+            { echo "ROOT_PART_NAME cannot be more than 16 characters."; exit 1; }
+        echo $ROOT_PART_NAME | egrep -q '^[a-zA-Z0-9_-]*$' || \
+            { echo "ROOT_PART_NAME contains invalid characters"; exit 1; }
+
+        [ -z $MLO_FILE ] &&
+            { echo "Requires MLO_FILE."; exit 1; }
+        [ -f $MLO_FILE ] ||
+            { echo "Could not find MLO file: $MLO_FILE"; exit 1; }
+
+        [ -z $UBOOT_IMG_FILE ] &&
+            { echo "Requires UBOOT_IMG_FILE."; exit 1; }
+        [ -f $UBOOT_IMG_FILE ] ||
+            { echo "Could not find MLO file: $UBOOT_IMG_FILE"; exit 1; }
+    ;;
+create)
+    info "Creating image file..."
+    debug "TARBALL: $(br_tarball_path)"
+    debug "IMAGE: $(br_image_path bootroot img)"
+    debug "IMAGE_FILE_SIZE: ${IMAGE_FILE_SIZE}"
+    [ ! -f "$(br_tarball_path)" ] && fail "Could not find $(br_tarball_path)"
+    [ -z "$BR_FORCE" ] && [ -f "$(br_image_path bootroot img)" ] && \
+        fail "$(br_image_path bootroot img) already exists. Use -f option to overwrite."
+
+    mkdir -p "$(br_image_dir)"
+
+    guestfish -N "$(br_image_path bootroot img)"=disk:${IMAGE_FILE_SIZE} -- \
+        part-init /dev/sda mbr : \
+        part-add /dev/sda primary $(brp_to_sector 1) $(brp_to_sector 1 + 48) : \
+        part-add /dev/sda primary $(brp_to_sector 1 + 48) -1 : \
+        part-set-mbr-id /dev/sda 1 0x0b : \
+        mkfs fat /dev/sda1 : \
+        set-label /dev/sda1 ${BOOT_PART_NAME} : \
+        mkfs ext4 /dev/sda2 : \
+        set-label /dev/sda2 ${ROOT_PART_NAME} : \
+        mount /dev/sda2 / : \
+        tar-in "$(br_tarball_path)" / : \
+        mkdir-p /media/mmc_p1 : \
+        mount /dev/sda1 /media/mmc_p1 : \
+        glob mv /boot/flash/* /media/mmc_p1/ : \
+
+        dd if=${MLO_FILE} of="$(br_image_path bootroot img)" count=1 seek=1 bs=128k
+        dd if=${UBOOT_IMG_FILE} of="$(br_image_path bootroot img)" count=2 seek=1 bs=384k
+
+    ;;
+
+    *)
+        echo "Usage: $(basename $0) { validate | create }"
+        exit 1
+esac
